@@ -203,7 +203,7 @@ The interactive `srun --pty` item is left for hands-on use (it needs a real term
 - `05` with `FAIL=1`: stage2 goes to `DependencyNeverSatisfied` (kept because of `--kill-on-invalid-dep=no`).
 - Drain: a job pinned to `-p agx` pends with "Nodes required for job are DOWN, DRAINED…" and runs right after `resume`.
 
-## Phase 4: distributed training under Slurm
+## Phase 4: distributed training under Slurm ✅ done 2026-09-23
 
 - `train/ddp_train.py`: a small model on a public dataset. **Public data only (PHI rule):**
   e.g. ResNet-18 on CIFAR-10, or a char-level GPT on tiny-shakespeare. Pre-download the dataset to
@@ -216,11 +216,27 @@ The interactive `srun --pty` item is left for hands-on use (it needs a real term
   Orin a smaller per-rank batch and compare.
 - Save checkpoints to `~/shared/slurm-lab/ckpt`, then practice `scancel` followed by resume-from-checkpoint (`--requeue`).
 
-## Phase 5: wrap-up
+**Results (2026-09-23):**
+- `train/ddp_train.py`: a char-level GPT (0.83M params, 4 layers, dim 128) on tiny-shakespeare (`data/tinyshakespeare.txt`, public),
+  gloo, rank 0 saving atomically to `ckpt/ddp.pt` every 25 steps, auto-resume. It's tiny on purpose, since each step all-reduces ~3.3 MB of grads over WiFi.
+- **Hang #1: rendezvous ok, then the workers hang in init.** Ranks come from c10d rendezvous join order, not the nodelist, so the DGX can be rank 0.
+  The rank-0 agent advertises its hostname for the worker store, `spark-79b7` → 127.0.0.1, and the workers got
+  `MASTER_ADDR=localhost`. Fix: `torchrun --local-addr=<LAN IP>` per host (in `jobs/ddp.sbatch`).
+- 2-node step ≈ **450 ms**. Solo (`--standalone`, one GPU) ≈ **17 ms DGX, ~45 ms Orin**. So ~90% of each step is the
+  gloo gradient all-reduce over WiFi (~8 MiB/s). The Orin's slower compute is noise. The smaller-Orin-batch exercise is moot.
+- 300 steps: loss 2.9 (step 10) → 2.08, val 2.11, and the sample is Shakespeare-shaped gibberish.
+- Requeue: `scontrol requeue <id>` after the step-75 checkpoint → the step is CANCELLED "DUE TO JOB REQUEUE", then the job pends with
+  **Reason=BeginTime, ~2 min** (Slurm's built-in requeue delay), restarts with `SLURM_RESTART_COUNT=1`, prints "resumed at step 75" on both ranks, and
+  finishes. `--open-mode=append` keeps both runs in one log. (`scancel` removes the job for good. Requeue is `scontrol requeue`.)
+
+## Phase 5: wrap-up ✅ done 2026-09-23
 
 - `cluster-down.sh`; confirm the Slurm units are disabled at boot on both nodes.
 - `NOTES.md`: a Slurm cheat-sheet built from what was actually run, plus gotchas hit.
 - Blog draft (the Create Project workflow already opened a blog PR).
+
+**Results:** the cheat-sheet and gotchas live in `docs/learning-slurm.md` §5–6, not a separate NOTES.md. The blog draft is filled in on
+miramar-labs-org.github.io PR #80 (unmerged: merging publishes it). The cluster was stopped with `cluster-down.sh`, and all units are disabled at boot.
 
 ---
 
