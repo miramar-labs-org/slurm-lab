@@ -4,6 +4,8 @@
 
 Learn Slurm in a day: DGX Spark + AGX Orin as a 2-node GPU cluster running a distributed PyTorch job
 
+**Start here: [Learning Slurm on a Two-Node Home Cluster](docs/learning-slurm.md)**. A tutorial covering concepts, the build, exercises, and troubleshooting. The lab notebook is [PLAN.md](PLAN.md).
+
 ## Platform endpoints
 
 All services require the SSH tunnel from your laptop:
