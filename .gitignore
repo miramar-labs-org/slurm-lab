@@ -1,3 +1,9 @@
 
 # Per-project JupyterLab kernel venv
 .venv/
+
+# Cluster run artifacts (shared FS working copy)
+logs/
+data/
+ckpt/
+runs/
