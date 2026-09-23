@@ -119,7 +119,8 @@ slurm-lab/                 lives at ~/shared/slurm-lab (same path on both nodes)
 │   ├── cluster-up.sh         start munge/slurmctld/slurmd on both (run on DGX)
 │   └── cluster-down.sh       stop everything
 ├── train/nccl_test.py     cross-node all-reduce test (nccl | gloo)
-├── jobs/                  exercises 01–05
+├── train/ddp_train.py     char-level GPT, DDP + checkpoint/resume (the capstone)
+├── jobs/                  exercises 01–05 + ddp.sbatch
 └── logs/ data/ ckpt/ runs/   job artifacts (gitignored)
 ```
 
@@ -517,7 +518,87 @@ sudo scontrol update nodename=orin state=resume   # the pending job runs right a
 `drain` lets running jobs finish but takes no new ones. It's how you take a node out for maintenance
 without killing anybody's work. `down` is the hard version.
 
-### 4.8 Try it yourself: interactive jobs
+### 4.8 The capstone: multi-node DDP (`jobs/ddp.sbatch`, `train/ddp_train.py`)
+
+Everything so far leads here: one PyTorch training job spanning both GPUs. The pattern is
+**Slurm allocates, `srun` starts one `torchrun` per node, and `torchrun` starts the training process(es) on that node**.
+
+```bash
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=1          # one torchrun per node
+#SBATCH --gres=gpu:1
+#SBATCH --requeue                    # allowed to be put back in the queue
+#SBATCH --open-mode=append           # a requeued run appends to the same log
+
+MASTER=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -1)
+MASTER_ADDR=$(scontrol show node "$MASTER" | grep -oP 'NodeAddr=\K\S+')   # IP, never the hostname
+srun bash -c '
+  case $(hostname) in                        # per-node settings
+    spark-79b7) export GLOO_SOCKET_IFNAME=wlP9s9   LOCAL_ADDR=192.168.1.200 ;;
+    orin)       export GLOO_SOCKET_IFNAME=wlP1p1s0 LOCAL_ADDR=192.168.1.202 ;;
+  esac
+  exec torchrun --nnodes=2 --nproc-per-node=1 --local-addr=$LOCAL_ADDR \
+    --rdzv-backend=c10d --rdzv-id=$SLURM_JOB_ID --rdzv-endpoint='"$MASTER_ADDR"':29500 train/ddp_train.py'
+```
+
+The model is a 0.83M-parameter char-level GPT trained on tiny-shakespeare (public, in `data/`). It's tiny on purpose:
+every step all-reduces its ~3.3 MB of gradients over WiFi.
+
+```bash
+sbatch jobs/ddp.sbatch             # 300 steps; rm ckpt/ddp.pt to start over
+```
+
+```
+[rank 0/2] host=spark-79b7 gpu=NVIDIA GB10 params=0.83M batch=32 fresh start
+[rank 1/2] host=orin gpu=Orin params=0.83M batch=32 fresh start
+[rank 1 orin] step 10/300 loss 2.992 491 ms/step
+[rank 0 spark-79b7] step 10/300 loss 2.913 502 ms/step
+...
+[rank 0 spark-79b7] step 300/300 loss 2.080 448 ms/step
+[rank 0] val loss 2.114
+```
+
+**Where does the time go?** Run the same script alone on each GPU (`torchrun --standalone`, one node):
+
+| Setup | ms/step |
+|---|---|
+| DGX alone | ~17 |
+| Orin alone | ~45 |
+| Both, DDP over WiFi | ~450 |
+
+About 90% of each distributed step is the gradient all-reduce. Two GPUs over WiFi are **~25× slower than
+one GPU alone**. This is why real clusters spend so much on InfiniBand and NVLink, and why "add more
+nodes" only helps when compute per step is large compared with the bytes each step has to move.
+
+**Hang: rendezvous succeeds, then the workers wait forever.** Our first run hung silently. The workers'
+environment showed `MASTER_ADDR=localhost`. torchrun's c10d rendezvous assigns ranks in *join order*
+(not nodelist order), so the DGX can be rank 0. Rank 0 advertises its **hostname** for the worker store, and the DGX
+resolves its own name to 127.0.0.1. `--local-addr=<LAN IP>` makes each node advertise a reachable address. (The
+127.0.0.1 hostname trap from 3.2, once again.)
+
+**Checkpoint, requeue, resume.** Rank 0 saves `ckpt/ddp.pt` every 25 steps (writes to a temp file, then
+`os.replace`, so a kill mid-save never leaves a half-written checkpoint), and the script resumes from it at startup.
+To simulate a preemption, requeue the running job:
+
+```bash
+scontrol requeue <jobid>
+squeue -j <jobid> -o "%T %r %S"      # PENDING BeginTime 11:56:14   ← ~2 min requeue hold
+```
+
+```
+[rank 0] checkpoint step 75 -> ckpt/ddp.pt
+slurmstepd-orin: error: *** JOB 36 ON orin CANCELLED AT 2026-09-23T11:54:10 DUE TO JOB REQUEUE ***
+== 2026-09-23T11:56:33-07:00 job 36 restart=1 nodes=orin,spark-79b7 master=orin(192.168.1.202)
+[rank 0/2] host=spark-79b7 ... resumed at step 75
+[rank 1/2] host=orin ... resumed at step 75
+```
+
+Same job ID, `SLURM_RESTART_COUNT=1`, and both runs in one log. Steps 76–80 were lost, since the
+checkpoint only reaches step 75, so checkpoint frequency sets how much work a preemption costs. Note that
+`scancel` doesn't requeue: it removes the job for good. On real clusters the requeue usually comes from
+preemption or a node failure, not from you.
+
+### 4.9 Try it yourself: interactive jobs
 
 ```bash
 srun -p agx --gres=gpu:1 --pty bash     # a shell on the Orin, holding its GPU
@@ -546,6 +627,8 @@ The first place to look is always the logs: `/var/log/slurm/slurmctld.log` on th
 | Reason text is stale after fixing | Reason strings stick until the next state change | Harmless. Cycle the node or the cluster. |
 | `usermod: user is currently used by process` | Processes still running as that user, e.g. a linger-respawned user manager | `loginctl disable-linger` first (3.1) |
 | `pkill -f pattern` over ssh kills your own ssh | The pattern matches the ssh command line itself | Kill by PID, or use a pattern that can't match itself |
+| DDP: rendezvous OK, then the workers hang; their env shows `MASTER_ADDR=localhost` | The rank-0 node advertised a hostname that resolves to 127.0.0.1 | `torchrun --local-addr=<LAN IP>` (4.8) |
+| Requeued job sits `PENDING (BeginTime)` | Slurm holds a requeued job for ~2 min before it can start | Wait. That's expected. |
 | NCCL `nvmlDeviceGetP2PStatus ... Not Supported` on Jetson | Jetson NVML is partial, and NCCL treats the failure as fatal | Use gloo (3.5) |
 
 ### Deep dive: `InvalidAccount` without an accounting database
@@ -622,12 +705,8 @@ munge -n | ssh <other-node> unmunge            # auth works across nodes?
 
 ## 7. What's next
 
-- **Phase 4: distributed training under Slurm.** `train/ddp_train.py` plus `jobs/ddp.sbatch`:
-  `-N2 --ntasks-per-node=1 --gres=gpu:1`, master address = the first host in the node list (the `orin`!),
-  `srun torchrun --rdzv-backend=c10d --rdzv-endpoint=$MASTER:29500`, backend **gloo** with
-  `GLOO_SOCKET_IFNAME` set per host. Public dataset only (CIFAR-10 / tiny-shakespeare) in `data/`.
-  Then checkpoint to `ckpt/`, `scancel`, and resume with `--requeue`.
-- **Phase 5: wrap-up.** `cluster-down.sh`, confirm the units are disabled at boot, and a blog post.
+Phases 0–5 are done (see PLAN.md). Where to go from here:
+
 - **Stretch goals:**
   - slurmdbd + MariaDB, which gives you `sacct`/`sreport` and fixes `InvalidAccount` properly (slurmdbd doesn't support Postgres).
   - `ConstrainDevices=yes` in `cgroup.conf`: jobs can then only open the GPU device files they were
