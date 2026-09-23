@@ -23,7 +23,7 @@ them after (`scripts/cluster-up.sh` / `cluster-down.sh`).
 | GPU / compute cap | GB10 / sm_121 | Orin (nvgpu) / sm_87 |
 | Driver / CUDA toolkit | 580.173.02 / 13.0 | 595.78 / 13.2 |
 | `slurm-wlm` apt candidate | 23.11.4-1.2ubuntu5+esm1 | 23.11.4-1.2ubuntu5 |
-| `aaron` uid:gid | 1000:1000 | **2002:2002 → must become 1000:1000** |
+| `aaron` uid:gid | 1000:1000 | 1000:1000 (renumbered from 2002 on 2026-09-23) |
 | `~/shared` | local dir, exported over SMB | CIFS mount of `//spark-79b7.local/shared` (automount, fstab) |
 
 - Wired ports are down on both boxes, so everything uses WiFi. Ping RTT between them is 5–88 ms. Accepted.
@@ -47,7 +47,7 @@ command runs on every node: `~/.pyenv/versions/pySlurm/bin/python`.
 
 ## Phase 0: prerequisites
 
-### 0.1 Normalize the AGX `aaron` uid/gid 2002 → 1000
+### 0.1 Normalize the AGX `aaron` uid/gid 2002 → 1000 ✅ done 2026-09-23
 Slurm runs each job step as the *numeric* uid that submitted it, on every node. uid/gid
 1000 are free on the AGX. A filesystem scan found nothing owned by 2002 outside the home dir
 (`/mnt/nvme/home/aaron`, bind-mounted at `/home/aaron`, ~28.7k files).
@@ -66,16 +66,31 @@ your own ssh). So run it as a **detached root unit** and reconnect afterwards:
 2. Launch it: `scp` the script over, then `ssh agx 'sudo systemd-run --unit=uid-renumber bash /root/agx-renumber-uid.sh'`.
 3. Wait ~30 s, then `ssh aaron@192.168.1.202 id` should show `uid=1000`. Also check `ls -ln ~ | head`,
    `ls ~/shared`, `systemctl --user status jupyterlab`, `cat /root/uid-renumber.log`.
+
+**Result:** ran in ~11 s, 0 leftover 2002-owned files, fstab/automount, jupyterlab, ollama, and pySlurm torch all OK.
+Needed one extra step: the AGX has `Linger=yes`, so the script turns linger off before the kill
+(otherwise `user@2002` respawns and `usermod` fails), then back on at the end.
 4. Fallback if ssh breaks: the AGX has a local console (monitor + keyboard), with passwordless sudo.
 
-### 0.2 Name resolution
+### 0.2 Name resolution ✅ done 2026-09-23
 `orin.local` mDNS is unreliable (platform rule: reach the AGX by IP). Add to `/etc/hosts` on **both**:
 ```
 192.168.1.200 spark-79b7
 192.168.1.202 orin
 ```
 
-### 0.3 Firewall / ports
+### 0.3 Firewall / ports ✅ checked 2026-09-23
+**Result:** no LAN filtering on either node. DGX `ufw` is inactive. The AGX has no ufw; its only
+DROP rule is Tailscale's `ts-input` (drops 100.64/10 not on tailscale0).
+
+**Name-resolution gotchas found:**
+- The DGX `/etc/hosts` line 2 maps `127.0.0.1 spark-79b7`. It's pre-existing and left alone (k3s and the
+  platform may depend on it), so on the DGX its own hostname resolves to loopback. Mitigation: always set
+  `NodeAddr`/`SlurmctldHost` IPs explicitly in slurm.conf, and pass `--rdzv-endpoint=192.168.1.200` by IP.
+- On the AGX, `getent hosts orin` returns IPv6 addresses (nss-myhostname). `ahostsv4` returns the right
+  IPv4, which is another reason to use explicit IPs.
+- Backups of the original files: `/etc/hosts.bak-slurm-lab` on both nodes.
+
 Check `ufw status` on both. Slurm needs 6817 (slurmctld), 6818 (slurmd), and the `srun` port
 range (`SrunPortRange=60001-60100` in slurm.conf). The PyTorch rendezvous needs 29500, plus the ports NCCL picks at random.
 
