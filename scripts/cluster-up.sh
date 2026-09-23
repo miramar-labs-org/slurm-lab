@@ -7,6 +7,8 @@ sudo systemctl start munge
 ssh "$AGX" 'sudo systemctl start munge' 2>&1 | grep -v openshell || true
 munge -n | ssh "$AGX" unmunge 2>&1 | grep -E '^STATUS' || { echo "munge cross-node check failed"; exit 1; }
 
+# Accounting first: slurmctld registers with slurmdbd at startup.
+sudo systemctl start mariadb slurmdbd
 sudo systemctl start slurmctld slurmd
 ssh "$AGX" 'sudo systemctl start slurmd' 2>&1 | grep -v openshell || true
 

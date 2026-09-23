@@ -34,7 +34,7 @@ program on them and cleans up afterwards.
 | **`slurmctld`** | the controller (one node) | The brain. Holds the queue, decides what runs where, and tracks node state. |
 | **`slurmd`** | every compute node | The hands. Receives work from `slurmctld`, launches processes, and reports back. |
 | **`munge`** | every node | Authentication. Every Slurm message is signed with a shared secret key, so nodes can trust each other's claims about who a user is. |
-| `slurmdbd` | optional, one node | Accounting database (job history, fair-share, quotas). **We don't run it**, and section 5 shows what that costs. |
+| `slurmdbd` | optional, one node | Accounting daemon in front of a MariaDB database: job history, accounts, fair-share, quotas. We added it last (3.11), and section 5 shows what running without it costs. |
 | `slurm.conf` | identical on every node | The single description of the whole cluster: nodes, partitions, plugins. |
 
 ### The vocabulary
@@ -95,6 +95,7 @@ a directory service) we had to provide by hand. That's where the learning is.
 ```
                  ┌──────────────────────── DGX Spark (spark-79b7, .200) ─────────────────────┐
  you ── sbatch ─►│ slurmctld  (queue + scheduler, :6817)                                     │
+                 │ slurmdbd   (accounting, :6819) → MariaDB (127.0.0.1:3306)                 │
                  │ slurmd     (compute, :6818)      GPU: gb10  File=/dev/nvidia0             │
                  │ munge      (auth)                ~/shared/slurm-lab  ← local dir, SMB export│
                  └──────────────┬──────────────────────────────────┬─────────────────────────┘
@@ -112,11 +113,13 @@ a directory service) we had to provide by hand. That's where the learning is.
 slurm-lab/                 lives at ~/shared/slurm-lab (same path on both nodes)
 ├── PLAN.md                phase plan + verified facts + decisions (the lab notebook)
 ├── docs/learning-slurm.md this guide
-├── slurm/                 slurm.conf, gres.conf, cgroup.conf → /etc/slurm on both nodes
+├── slurm/                 slurm.conf, gres.conf, cgroup.conf → /etc/slurm on both nodes;
+│                          slurmdbd.conf + mariadb-slurm.cnf → DGX only
 ├── scripts/
 │   ├── agx-renumber-uid.sh   one-off: make the Orin's uid match the DGX
 │   ├── install-node.sh       apt install + disable units + install configs (per node)
-│   ├── cluster-up.sh         start munge/slurmctld/slurmd on both (run on DGX)
+│   ├── install-dbd.sh        DGX only: MariaDB + slurmdbd + account setup
+│   ├── cluster-up.sh         start munge/mariadb/slurmdbd/slurmctld/slurmd (run on DGX)
 │   └── cluster-down.sh       stop everything
 ├── train/nccl_test.py     cross-node all-reduce test (nccl | gloo)
 ├── train/ddp_train.py     char-level GPT, DDP + checkpoint/resume (the capstone)
@@ -271,16 +274,22 @@ SlurmctldHost=spark-79b7(192.168.1.200)   # controller, with an explicit IP (see
 AuthType=auth/munge
 
 SchedulerType=sched/backfill
-SchedulerParameters=bf_interval=2          # see section 5, "InvalidAccount"
+#SchedulerParameters=bf_interval=2         # only needed without slurmdbd (section 5, "InvalidAccount")
 SelectType=select/cons_tres                # schedule individual cores/memory/GPUs, not whole nodes
 SelectTypeParameters=CR_Core_Memory
+DefMemPerCPU=1024                          # see 3.11: without it every job books the whole node's memory
 ProctrackType=proctrack/cgroup             # track job processes with cgroups (clean kill on scancel)
 TaskPlugin=task/cgroup,task/affinity       # pin tasks to their allocated CPUs
 ReturnToService=2                          # a node that went DOWN comes back when slurmd re-registers
 GresTypes=gpu
 LaunchParameters=disable_send_gids         # see 3.9
 
-AccountingStorageType=accounting_storage/none   # no slurmdbd (yet)
+JobAcctGatherType=jobacct_gather/linux     # per-step CPU/memory sampling for sacct (3.11)
+JobAcctGatherFrequency=task=5
+AccountingStorageType=accounting_storage/slurmdbd   # job records go to slurmdbd (3.11)
+AccountingStorageHost=192.168.1.200
+AccountingStorageEnforce=associations      # only registered user/account pairs may submit
+AccountingStorageTRES=gres/gpu             # record GPUs too
 
 # RealMemory is well below physical: both boxes are unified-memory and share RAM with other services
 NodeName=spark-79b7 NodeAddr=192.168.1.200 CPUs=20 ... RealMemory=32000 Gres=gpu:gb10:1
@@ -364,7 +373,7 @@ the job on the Orin shows `44(video)` and `993(render)`, and CUDA works.
 ### 3.10 Start, verify, stop
 
 ```bash
-scripts/cluster-up.sh      # munge on both → munge cross-check → slurmctld+slurmd → resume nodes → sinfo
+scripts/cluster-up.sh      # munge on both → munge cross-check → mariadb+slurmdbd → slurmctld+slurmd → resume nodes → sinfo
 scripts/cluster-down.sh    # stop everything on both nodes (frees the boxes)
 ```
 
@@ -378,6 +387,91 @@ $ srun -N2 --gres=gpu:1 python -c "import torch,socket; print(socket.gethostname
 orin Orin
 spark-79b7 NVIDIA GB10
 ```
+
+### 3.11 Accounting: slurmdbd + MariaDB
+
+Up to here the cluster had no memory: once a job left `squeue` it was gone. **slurmdbd** is the accounting
+daemon. slurmctld sends it every job record, and it stores them in a database. That gets you:
+
+- **Job history:** `sacct` (what ran, where, for how long, peak memory, exit code) and `sreport` (usage roll-ups).
+- **Associations:** a hierarchy of *cluster → account → user*, which is what fair-share, quotas and QOS limits hang off.
+- The proper fix for the `InvalidAccount` stall (section 5).
+
+**Why MariaDB and not the platform's Postgres:** slurmdbd only speaks MySQL/MariaDB. It once had a
+PostgreSQL plugin, but that was removed years ago. It runs **host-native on the DGX**, not in k3s: its only consumer is
+slurmdbd on the same host, and `cluster-up.sh`/`cluster-down.sh` start and stop it with the rest of the lab.
+
+`scripts/install-dbd.sh` (run once, with sudo, on the DGX) installs `mariadb-server` + `slurmdbd`, applies
+`slurm/mariadb-slurm.cnf` (listen on 127.0.0.1 only) and `slurm/slurmdbd.conf`, creates the database, and registers
+the associations. There's **no password anywhere**: the DB user is created with MariaDB's socket auth, so the `slurm`
+OS user that slurmdbd runs as is let in by identity:
+
+```sql
+CREATE USER 'slurm'@'localhost' IDENTIFIED VIA unix_socket;
+GRANT ALL ON slurm_acct_db.* TO 'slurm'@'localhost';
+```
+
+`slurmdbd.conf` must be owned by `slurm` and mode 600, or slurmdbd refuses to start. It needs munge too, so start
+munge before it (`cluster-up.sh` does). Then register the association tree:
+
+```bash
+sacctmgr -i add cluster miramar                 # must match ClusterName in slurm.conf
+sacctmgr -i add account lab Description=slurm-lab Organization=miramar
+sacctmgr -i add user aaron Account=lab DefaultAccount=lab
+sacctmgr show assoc format=cluster,account,user
+#  miramar  root
+#  miramar  root  root
+#  miramar  lab
+#  miramar  lab   aaron
+```
+
+and point `slurm.conf` at it:
+
+```ini
+AccountingStorageType=accounting_storage/slurmdbd
+AccountingStorageHost=192.168.1.200
+AccountingStorageEnforce=associations    # unregistered user/account → rejected at submit
+AccountingStorageTRES=gres/gpu           # record GPUs, not just cpu/mem/node
+JobAcctGatherType=jobacct_gather/linux   # sample per-step CPU/memory
+JobAcctGatherFrequency=task=5            # every 5 s (default 30)
+```
+
+Enforcement in action:
+
+```
+$ sbatch -A nosuchacct --wrap hostname
+sbatch: error: Batch job submission failed: Invalid account or account/partition combination specified
+$ sbatch -A lab --wrap hostname
+Submitted batch job 53
+```
+
+And the history:
+
+```
+$ sacct -S now-1hour -o JobID,JobName,NodeList,MaxRSS,AllocTRES%45
+JobID        JobName   NodeList     MaxRSS                                     AllocTRES
+51           rss2g     spark-79b7              billing=1,cpu=1,mem=1G,node=1
+51.batch     batch     spark-79b7   2107792K   cpu=1,mem=1G,node=1
+46           gpuwork   spark-79b7              billing=1,cpu=1,gres/gpu=1,mem=1G,node=1
+```
+
+Each job has a line of its own plus one line per step (`.batch`, `.0`, `.extern`). `MaxRSS` is per step.
+
+**What turning on accounting revealed.** The first `sacct` output showed three problems at once:
+
+1. **`AllocTRES` showed `mem=16000M` for a 1-CPU job.** With `CR_Core_Memory`, memory is a consumable
+   resource, and a job that doesn't ask for any gets the node's *entire* `RealMemory`. So every job had been
+   booking a whole node, and two small jobs could never share one. It had been like that since Phase 2, invisible
+   until accounting showed it. Fix: `DefMemPerCPU=1024`. Afterwards three 1-CPU jobs ran side by side on the Orin.
+   (It's a scheduling figure only. `ConstrainRAMSpace=no` means nothing enforces it.)
+2. **No GPUs in `AllocTRES`.** Only cpu/mem/node/billing are tracked by default. Fix: `AccountingStorageTRES=gres/gpu`.
+3. **`MaxRSS` was always 0**, even for a job holding 2 GB for 80 s. With `jobacct_gather/cgroup`, CPU also read 0,
+   although the task's cgroup `memory.current` held the right number. We didn't isolate the cause. Switching to
+   `jobacct_gather/linux` (reads `/proc`) gave the correct 2.1 GB on both nodes.
+
+> **Expected warning:** slurmdbd logs `Database settings not recommended values: innodb_buffer_pool_size`.
+> It hard-codes a 4 GB recommendation, which is production sizing. A lab database of a few hundred jobs fits easily in
+> the 256 MB we give it, and on a unified-memory box every GB the database holds is a GB the GPU can't use.
 
 ---
 
@@ -619,7 +713,7 @@ The first place to look is always the logs: `/var/log/slurm/slurmctld.log` on th
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Every job sits `PENDING (InvalidAccount)` for up to 30 s on an idle cluster | No slurmdbd. See below. | `SchedulerParameters=bf_interval=2`, or run slurmdbd |
+| Every job sits `PENDING (InvalidAccount)` for up to 30 s on an idle cluster | No slurmdbd. See below. | Run slurmdbd (3.11), or `SchedulerParameters=bf_interval=2` as a stopgap |
 | Node `inval`, "gres/gpu count reported lower than configured (0 < 1)" | GPU declared without `File=`, and the slurmd log says "Ignoring file-less GPU" | Declare the real device file (3.9) |
 | `NvRmMemInitNvmap failed: Permission denied` / "No CUDA GPUs are available" only under Slurm | Job got the controller's numeric groups, missing `video`/`render` | `LaunchParameters=disable_send_gids` (3.9) |
 | Node shows `idle*` / `down*` | slurmd not running or unreachable | Start slurmd; check ports 6817/6818; `ReturnToService=2` brings it back |
@@ -629,6 +723,10 @@ The first place to look is always the logs: `/var/log/slurm/slurmctld.log` on th
 | `pkill -f pattern` over ssh kills your own ssh | The pattern matches the ssh command line itself | Kill by PID, or use a pattern that can't match itself |
 | DDP: rendezvous OK, then the workers hang; their env shows `MASTER_ADDR=localhost` | The rank-0 node advertised a hostname that resolves to 127.0.0.1 | `torchrun --local-addr=<LAN IP>` (4.8) |
 | Requeued job sits `PENDING (BeginTime)` | Slurm holds a requeued job for ~2 min before it can start | Wait. That's expected. |
+| Small jobs never share a node; `sacct` AllocTRES shows the node's full `mem=` | `CR_Core_Memory` with no default: a job without `--mem` books all `RealMemory` | `DefMemPerCPU=` (3.11) |
+| `sacct` MaxRSS always 0 | `jobacct_gather/none`, or (here) `jobacct_gather/cgroup` reading nothing | `JobAcctGatherType=jobacct_gather/linux` (3.11) |
+| `Invalid account or account/partition combination specified` | `AccountingStorageEnforce=associations` and no association for this user/account | `sacctmgr add user <u> Account=lab` |
+| slurmdbd won't start: `Unable to initialize authentication plugins` | munge isn't running | Start munge first |
 | NCCL `nvmlDeviceGetP2PStatus ... Not Supported` on Jetson | Jetson NVML is partial, and NCCL treats the failure as fatal | Use gloo (3.5) |
 
 ### Deep dive: `InvalidAccount` without an accounting database
@@ -660,9 +758,11 @@ Backfill doesn't run that check, so it starts the job on its next pass. (Source:
 uses accounting data) and tried `priority/basic`. There was no change, so we reverted it. Change one thing at a
 time and undo what didn't work.
 
-**Fix.** `SchedulerParameters=bf_interval=2` makes backfill run every 2 s, so jobs start in about 1–2 s.
-Side effect: pending jobs show reason `None` instead of `Resources`. The proper fix is running slurmdbd,
-which also gives you `sacct` job history.
+**Stopgap.** `SchedulerParameters=bf_interval=2` makes backfill run every 2 s, so jobs start in about 1–2 s.
+Side effect: pending jobs show reason `None` instead of `Resources`.
+
+**Proper fix.** Run slurmdbd (3.11). With real association data loaded, the main scheduler's check passes.
+We removed `bf_interval=2`, went back to the default 30 s, and jobs still started 0.4–3 s after submission.
 
 ---
 
@@ -694,6 +794,15 @@ $SLURM_JOB_ID $SLURM_JOB_NODELIST $SLURM_NNODES $SLURM_NTASKS
 $SLURM_PROCID $SLURM_LOCALID $SLURM_NODEID $SLURM_ARRAY_TASK_ID $CUDA_VISIBLE_DEVICES
 scontrol show hostnames "$SLURM_JOB_NODELIST"
 
+# ── accounting ───────────────────────────────────────────────────────
+sacct                                     # your jobs since midnight
+sacct -S now-1day -o JobID,JobName,NodeList,State,Elapsed,MaxRSS,AllocTRES%40
+sacct -j <id> --long | less -S            # everything, per step
+sstat -j <id>.batch -o MaxRSS,AveCPU      # live usage of a running step
+sacctmgr show assoc format=cluster,account,user
+sudo sacctmgr -i add user bob Account=lab # let a new user submit (Enforce=associations)
+sreport cluster utilization
+
 # ── debug ────────────────────────────────────────────────────────────────
 sudo tail -f /var/log/slurm/slurmctld.log      # DGX
 sudo tail -f /var/log/slurm/slurmd.log         # each node
@@ -708,7 +817,6 @@ munge -n | ssh <other-node> unmunge            # auth works across nodes?
 Phases 0–5 are done (see PLAN.md). Where to go from here:
 
 - **Stretch goals:**
-  - slurmdbd + MariaDB, which gives you `sacct`/`sreport` and fixes `InvalidAccount` properly (slurmdbd doesn't support Postgres).
   - `ConstrainDevices=yes` in `cgroup.conf`: jobs can then only open the GPU device files they were
     allocated. Watch what the Orin's extra device nodes (`/dev/nvmap`, render node) do to that.
   - The NVML shim, to get NCCL working on the Orin.
@@ -719,6 +827,7 @@ Phases 0–5 are done (see PLAN.md). Where to go from here:
 
 | Term | Meaning |
 |---|---|
+| **Association** | A cluster/account/user (optionally partition) record in the accounting DB. Limits, fair-share and QOS attach to it. |
 | **Allocation** | The set of resources (nodes/CPUs/GPUs/memory) granted to a job |
 | **Backfill** | A scheduler that starts lower-priority jobs early when they fit in gaps without delaying higher-priority ones |
 | **cgroup** | A Linux kernel feature for grouping and limiting processes. Slurm uses it to track job processes and fence CPUs, memory and devices. |
@@ -733,3 +842,4 @@ Phases 0–5 are done (see PLAN.md). Where to go from here:
 | **Rank** | A process's index in a distributed job (`SLURM_PROCID`, torch `RANK`) |
 | **slurmctld / slurmd / slurmdbd** | Controller / per-node compute daemon / accounting database daemon |
 | **Task** | One process launched by `srun` |
+| **TRES** | Trackable RESource: cpu, mem, node, gres/gpu, billing… the units Slurm allocates and accounts |
