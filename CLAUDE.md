@@ -2,9 +2,8 @@
 
 ## What this repo is
 
-slurm-lab — a Miramar platform project on the DGX Spark / AGX Orin.
+slurm-lab — learn Slurm in a day: DGX Spark + AGX Orin as a 2-node Slurm GPU cluster running a multi-node PyTorch DDP job. See `PLAN.md` (phases, verified facts, decisions). Slurm jobs use the `pySlurm` pyenv env (`~/.pyenv/versions/pySlurm`, same path on both nodes), not `.venv`.
 
-<!-- Replace the line above with a one-sentence description. -->
 
 ## JupyterLab
 
