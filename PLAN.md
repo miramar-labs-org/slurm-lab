@@ -96,7 +96,7 @@ range (`SrunPortRange=60001-60100` in slurm.conf). The PyTorch rendezvous needs 
 
 ---
 
-## Phase 1: test the network path first (no Slurm yet)
+## Phase 1: test the network path first (no Slurm yet) ✅ done 2026-09-23: **gloo**
 
 Prove the two GPUs can do an NCCL all-reduce over WiFi *before* adding Slurm on top.
 
@@ -114,6 +114,18 @@ Prove the two GPUs can do an NCCL all-reduce over WiFi *before* adding Slurm on 
 - **If NCCL fails across the two GPU architectures:** fall back to `backend="gloo"`
   (all-reduce goes through the CPU). `GLOO_SOCKET_IFNAME` needs the exact interface name per node, so set it by hostname.
   Record which backend works. Phase 4 uses it.
+
+**Result (2026-09-23): NCCL fails on the Orin, gloo works. Phase 4 uses `backend="gloo"`.**
+- NCCL 2.30.7 (from the torch wheel) on the Orin fails at comm init with `ncclSystemError`:
+  `nvmlDeviceGetP2PStatus(0,0,NVML_P2P_CAPS_INDEX_READ) failed: Not Supported`. Jetson's NVML doesn't
+  implement it, and NCCL calls it unconditionally in `ncclNvmlEnsureInitialized`, so
+  `NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1 NCCL_NVLS_ENABLE=0` doesn't help. The DGX side is fine (it waits and times out).
+- gloo: correctness OK. A 16 MiB fp32 all-reduce takes **~2.5 s/iter (busbw ~6.3 MiB/s)** over WiFi.
+  Run with `GLOO_SOCKET_IFNAME=wlP9s9` (DGX) / `wlP1p1s0` (AGX) and `train/nccl_test.py --backend gloo`.
+- Stretch ideas to get NCCL working, untested: pin an older `nvidia-nccl-cu13` on both nodes, or
+  shim `libnvidia-ml.so.1` on the AGX so `nvmlDeviceGetP2PStatus` returns success with status "not supported".
+- The repo working tree is mirrored to the **same path on the AGX** (`rsync -a --exclude .venv --exclude .git`)
+  so the job command is identical on both nodes. Re-sync before each run until there's a shared checkout.
 
 ## Phase 2: install Slurm
 
