@@ -130,8 +130,11 @@ Prove the two GPUs can do an NCCL all-reduce over WiFi *before* adding Slurm on 
 - **Decision: gloo-only.** Stretch goal if NCCL is ever wanted: a ~20-line `libnvidia-ml.so.1` shim on the AGX
   (it links to the real lib and overrides only `nvmlDeviceGetP2PStatus` to return Success with status
   NOT_SUPPORTED), put first on `LD_LIBRARY_PATH` for the job. Expect little speedup, because WiFi TCP is the bottleneck either way.
-- The repo working tree is mirrored to the **same path on the AGX** (`rsync -a --exclude .venv --exclude .git`)
-  so the job command is identical on both nodes. Re-sync before each run until there's a shared checkout.
+- **The repo lives on the shared filesystem (2026-09-23):** the only working copy is `~/shared/slurm-lab`
+  (a local dir on the DGX, the CIFS mount of `//spark-79b7.local/shared` on the AGX). The same path works on both nodes,
+  and `~/git-miramar-labs-org/projects/slurm-lab` is a symlink to it on both. `logs/`, `data/`, `ckpt/`
+  and `runs/` sit inside it (gitignored). CIFS forces mode 0600 on the AGX, so invoke scripts via
+  `bash`/`python` (no exec bit). `sbatch file` is fine. Verified: a 2-node sbatch job ran from here and both nodes wrote to `logs/`.
 
 ## Phase 2: install Slurm ✅ done 2026-09-23
 

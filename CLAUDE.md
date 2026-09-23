@@ -4,10 +4,13 @@
 
 slurm-lab — learn Slurm in a day: DGX Spark + AGX Orin as a 2-node Slurm GPU cluster running a multi-node PyTorch DDP job. See `PLAN.md` (phases, verified facts, decisions). Slurm jobs use the `pySlurm` pyenv env (`~/.pyenv/versions/pySlurm`, same path on both nodes), not `.venv`.
 
+**Working copy = `~/shared/slurm-lab`** (the shared FS, same path on both nodes). `~/git-miramar-labs-org/projects/slurm-lab`
+is a symlink to it on both nodes. There's no rsync/second copy: edit here and jobs see it immediately. `logs/ data/ ckpt/ runs/` are gitignored.
+
 
 ## JupyterLab
 
-Click the **Open in JupyterLab** badge in the README (requires SSH tunnel). The project repo is at `~/git-miramar-labs-org/projects/slurm-lab` on the DGX.
+Click the **Open in JupyterLab** badge in the README (requires SSH tunnel). The project path `~/git-miramar-labs-org/projects/slurm-lab` on the DGX is a symlink to `~/shared/slurm-lab`.
 
 ## Platform endpoints
 
