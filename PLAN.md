@@ -186,7 +186,7 @@ One small `jobs/*.sbatch` per exercise, output to `~/shared/slurm-lab/logs/%x-%j
 - [x] Dependencies (`--dependency=afterok:<jobid>`) as a two-stage pipeline
 - [x] Node states: `scontrol update nodename=orin state=drain reason=test`, then `resume`
 - [x] Environment: `SLURM_JOB_NODELIST`, `scontrol show hostnames`, `SLURM_PROCID`, `SLURM_LOCALID`
-- [ ] Stretch: accounting (`slurmdbd` + MariaDB on the DGX; it doesn't support Postgres), then `sacct`/`sreport`
+- [x] Stretch: accounting (`slurmdbd` + MariaDB on the DGX; it doesn't support Postgres), then `sacct`/`sreport`
 
 **Result (2026-09-23):** exercises are in `jobs/01-05` (submit from the repo root). All ran on both nodes.
 The interactive `srun --pty` item is left for hands-on use (it needs a real terminal). Observations:
@@ -199,6 +199,16 @@ The interactive `srun --pty` item is left for hands-on use (it needs a real term
   (`_refresh_assoc_mgr_qos_list: no new list given back`). Backfill skips that check. Still unfixed in 23.11.11.
   `PriorityType=priority/basic` doesn't help (tested). Fix: `SchedulerParameters=bf_interval=2`, so jobs start in ~1–2 s.
   The proper fix is slurmdbd (stretch). Side effect: pending jobs show Reason `None` rather than `Resources`.
+  **Superseded 2026-09-23:** with slurmdbd running, jobs start in 0.4–3 s at the default bf_interval, so the line is now commented out.
+
+**Accounting result (2026-09-23):** host-native MariaDB 10.11 + slurmdbd on the DGX (`scripts/install-dbd.sh`,
+`slurm/slurmdbd.conf`, `slurm/mariadb-slurm.cnf`). MariaDB listens on 127.0.0.1 only, and the `slurm` DB user uses unix_socket auth, so there's no password.
+Associations: cluster `miramar` → account `lab` → user `aaron`. `AccountingStorageEnforce=associations` rejects unknown accounts and users.
+Not on k3s: slurmctld depends on it, and it must come up before k3s does. See guide §3.11. What `sacct` exposed:
+- No `DefMemPerCPU` → every job booked the node's entire memory, so jobs on a node ran serially. Set `DefMemPerCPU=1024`.
+- GPUs were missing from AllocTRES until `AccountingStorageTRES=gres/gpu`.
+- `jobacct_gather/cgroup` reported MaxRSS=0 and CPU=0 (cause not isolated). `jobacct_gather/linux` gives real numbers (MaxRSS ~2.1 GB/rank for ddp).
+- slurmdbd logs an `innodb_buffer_pool_size` warning (hard-coded 4 GB advice); 256M is kept deliberately on unified memory.
 - Array `04`: 8 tasks, 2 at a time, split 4/4 across nodes. lr 0.1–0.3 converge, ≤0.01 underfit in 50 steps.
 - `05` with `FAIL=1`: stage2 goes to `DependencyNeverSatisfied` (kept because of `--kill-on-invalid-dep=no`).
 - Drain: a job pinned to `-p agx` pends with "Nodes required for job are DOWN, DRAINED…" and runs right after `resume`.

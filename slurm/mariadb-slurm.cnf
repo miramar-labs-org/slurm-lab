@@ -1,0 +1,8 @@
+# MariaDB settings for slurmdbd (installed to /etc/mysql/mariadb.conf.d/99-slurm.cnf). Values from the Slurm accounting docs.
+[mysqld]
+bind-address=127.0.0.1
+# slurmdbd logs "not recommended values: innodb_buffer_pool_size": it hard-codes 4 GB (production sizing).
+# A lab DB of a few hundred jobs fits easily in 256M, and this box's RAM is unified with the GPU. Expected, harmless.
+innodb_buffer_pool_size=256M
+innodb_log_file_size=64M
+innodb_lock_wait_timeout=900
